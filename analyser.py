@@ -3,299 +3,353 @@ import googleapiclient.discovery
 import logging
 import json
 import re
-from crewai_tools import BaseTool
-from crewai import Agent, Task, Crew, Process
+import time
+import ollama
+from tqdm import tqdm
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
-from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class YouTubeCommentsTool(BaseTool):
-    name: str = "YouTube Comments Fetcher"
-    description: str = "Fetches all comments from a specified YouTube video using the YouTube Data API."
+# ── Configuration ────────────────────────────────────────────────────────────
+MAX_COMMENTS   = 500  # Maximum comments to fetch per run
+CHUNK_SIZE     = 50    # Comments per API call
+RETRY_ATTEMPTS = 3     # Number of retries on failure
+RETRY_DELAY    = 5     # Seconds to wait between retries
+OLLAMA_MODEL   = "mistral"  # Model to use — change to "llama3.2" if needed
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def extract_video_id(self, url):
+
+class YouTubeCommentsFetcher:
+    """Fetches top comments from a YouTube video using the YouTube Data API."""
+
+    def __init__(self):
+        self.api_key = os.getenv("YOUTUBE_API_KEY")
+        if not self.api_key:
+            raise ValueError("YOUTUBE_API_KEY not found in .env file.")
+        self.youtube = googleapiclient.discovery.build(
+            "youtube", "v3", developerKey=self.api_key
+        )
+
+    def extract_video_id(self, url: str):
         try:
             match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
             return match.group(1) if match else None
         except Exception as e:
-            logging.error(f"Video ID extract error: {e}")
+            logging.error(f"Video ID extraction error: {e}")
             return None
 
-    def _run(self, video_url: str) -> list:
-        try:
-            video_id = self.extract_video_id(video_url)
-            if not video_id:
-                logging.error("Invalid YouTube URL provided.")
-                return []
-
-          
-            api_key = os.getenv("YOUTUBE_API_KEY")
-            youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=api_key)
-
-            comments = []
-            next_page_token = None
-
-            while True:
-                
-                request = youtube.commentThreads().list(
-                    part="snippet",
-                    videoId=video_id,
-                    pageToken=next_page_token,
-                    maxResults=100,
-                    textFormat="plainText"
-                )
-                response = request.execute()
-
-                
-                for item in response["items"]:
-                    comment = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
-                    comment = self.clean_escape_characters(comment)
-                    comments.append(comment)
-
-               
-                next_page_token = response.get("nextPageToken")
-                if not next_page_token:
-                    break
-
-            
-            self.save_comments_to_json(comments)
-            logging.info(f"A total of {len(comments)} comments were retrieved.")
-            return comments
-        
-        except Exception as e:
-            logging.error(f"An error occurred: {e}")
-            return []
-
-    def clean_escape_characters(self, text):
-        """Remove escape characters and unwanted characters from the given text."""
-        text = re.sub(r'\\u[0-9A-Fa-f]{4}', '', text)  # Unicode 
+    def clean_text(self, text: str) -> str:
+        text = re.sub(r'\\u[0-9A-Fa-f]{4}', '', text)
         text = re.sub(r'\\U[0-9A-Fa-f]{8}', '', text)
-        text = re.sub(r'\\n', ' ', text)
-        text = re.sub(r'\\t', ' ', text)
-        text = re.sub(r'\\r', ' ', text)
-        text = re.sub(r'\\"', '', text) 
-        text = re.sub(r"\\'", "'", text)
-        text = re.sub(r'\\\$', '$', text)
-        text = re.sub(r'\\', '', text)
-        text = re.sub(r'\"', '', text) 
+        text = re.sub(r'[\\\n\t\r]', ' ', text)
+        text = re.sub(r'"+', '', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
-    def save_comments_to_json(self, comments):
-        try:
-            file_path = "comments.json"
-           
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(comments, f, ensure_ascii=False, indent=4)
-            logging.info("Comments have been saved to the JSON file.")
+    def fetch(self, video_url: str) -> list:
+        video_id = self.extract_video_id(video_url)
+        if not video_id:
+            logging.error("Invalid YouTube URL.")
+            return []
 
-        except Exception as e:
-            logging.error(f"Failed to save comments: {e}")
+        comments = []
+        next_page_token = None
+        logging.info(f"Fetching up to {MAX_COMMENTS} comments...")
 
-class CommentsAnalysis:
-    def __init__(self, comments_file_path):
-        self.comments_file_path = comments_file_path
-        self.llm = ChatGroq(
-            temperature=0,
-            groq_api_key=os.getenv("GROQ_API_KEY"),
-            model_name="llama3-70b-8192"
-        )
-        self.results = []
-        self.raw_results_file_path = "raw_results.json"
-        self.final_results_file_path = "final_results.json"
-        self.initialize_results_file()
-
-    def initialize_results_file(self):
-        
-        try:
-            with open(self.raw_results_file_path, "w", encoding="utf-8") as f:
-                json.dump([], f, ensure_ascii=False, indent=4)
-            logging.info(f"The file {self.raw_results_file_path} has been created.")
-        except Exception as e:
-            logging.error(f"Failed to create file: {e}")
-
-
-    def create_agent(self) -> Agent:
-        return Agent(
-            role="Tech Insights Analyst",
-            goal=(
-                "Generate and synthesize insights from YouTube comments on tech videos. "
-                "Analyze the comments from {comments_chunk} ONLY to find meaningful patterns and synthesize data into insights that highlight the core message of viewer feedback."
-            ),
-            backstory=(
-                "You are a sharp-witted analyst with a passion for the tech sector. "
-                "Skilled in navigating through noise in the comments data of {comments_chunk} ONLY to find meaningful patterns, "
-                "you synthesize data into insights that highlight the core message of viewer feedback. "
-                "Your analytical prowess ensures that the subtleties of audience engagement and preferences are captured and understood, "
-                "setting the stage for informed content strategies. All your results should be grounded in evidence from the comments, so cite appropriately. "
-                "Do not include any extra comments, explanations, or notes beyond the analysis."
-            ),
-            llm=self.llm,
-            allow_delegation=False,
-            verbose=True,
-            max_iter=10
-        )
-    
-    def create_task(self, agent: Agent, comments_chunk, task_id) -> Task:
-        return Task(
-            description=(
-                "Analyze the comments you received and generate actionable insights for comments list {comments_chunk} ONLY. "
-                "Focus on identifying common themes such as viewer pain points, requests, what viewers loved, and popular tech queries in the comments. "
-                "For the requests or troubleshooting, please provide 'suggested' solutions that you might have to help me get going quicker. "
-                "Add textual citation. Don't add comment numbers just comments. By citations, I mean showing the comments that led to that conclusion to support the claim. "
-                "Categorize by themes like 'Requests', 'Complaints', 'Suggestions', 'Praise', 'Troubleshooting', and other relevant ones you find useful. "
-                "The output should be a JSON formatted dictionary of key insights, categorized by themes like 'Requests', 'Complaints', 'Suggestions', 'Praise', 'Troubleshooting'. "
-                "Each theme should contain an array of objects, each with a 'comment' and 'insight' field. "
-                "Ensure the JSON output is valid by strictly following JSON format rules, such as using double quotes for strings and proper escaping of special characters. "
-                "Check for missing commas, colons, and brackets to ensure the output is a valid JSON. "
-                "Do NOT include any extra comments, explanations, or notes beyond the analysis. "
-                "Do NOT include notes such as 'Note: The above output is a JSON formatted dictionary of key insights, categorized by themes like 'Requests', 'Complaints', 'Suggestions, and other relevant ones' "
-                "or 'Please let me know if this meets the expected criteria.' "
-                "Do NOT Say 'This is the final answer.' Do NOT include anything else. Just the insights. Output must be strictly a valid JSON formatted dictionary. "
-                "Remove escape characters from comments. Don't include any extra comments, explanations, or notes beyond the analysis. "
-                "Ensure that only the following categories are used: 'Requests', 'Complaints', 'Suggestions', 'Praise', 'Troubleshooting'. "
-                "If a comment does not fit into one of these categories, classify it as 'Other'. "
-                "Ensure the JSON output is valid, without trailing commas or syntax errors. Ensure proper escaping and use double quotes for strings."
-                "Don't mention that ```json to by the end of the task do not do that. Don't include any extra comments, explanations, or notes beyond the analysis. Don't include any comment numbers."
-            ),
-            agent=agent,
-            expected_output=(
-                "A JSON formatted dictionary of key insights, categorized by themes like 'Requests', 'Complaints', 'Suggestions', 'Praise', 'Troubleshooting'. "
-                "Each theme should contain an array of objects, each with a 'comment' and 'insight' field. "
-                "Each result must be in exactly the same format. Do NOT ADD any other NOTES, COMMENTS, or EXPLANATIONS. Output must be strictly JSON formatted dictionary. "
-                "Do NOT Say 'This is the final answer.' Do NOT add any extra data to your results. Use double quotes for all strings. Don't include any comment numbers."
-                "Ensure the JSON output is valid, without trailing commas or syntax errors. Ensure proper escaping and use double quotes for strings."
-            ),
-            inputs={"comments_chunk": comments_chunk}
-        )
-
-    
-    def create_crew(self, agent: Agent, tasks: list) -> Crew:
-        return Crew(
-            agents=[agent],
-            tasks=tasks,
-            process=Process.sequential,
-            verbose=2,
-            memory=False,
-            max_rpm=100
-        )
-    
-    def split_comments(self, comments, chunk_size):
-        """Splits comments into chunks of a specified size."""
-        return [comments[i:i + chunk_size] for i in range(0, len(comments), chunk_size)]
-    
-    def append_result_to_json(self, result):
-        """Appends the result to the raw_results.json file."""
-        try:
-            with open(self.raw_results_file_path, "r+", encoding="utf-8") as f:
-                results = json.load(f)
+        with tqdm(total=MAX_COMMENTS, desc="📥 Fetching comments", unit="comment") as pbar:
+            while len(comments) < MAX_COMMENTS:
                 try:
-                    
-                    json_result = json.loads(result)
-                except json.JSONDecodeError as e:
-                    logging.error(f"JSON decode error: {e}")
-                    logging.error(f"Problematic result: {result}")
-                    return
+                    request = self.youtube.commentThreads().list(
+                        part="snippet",
+                        videoId=video_id,
+                        pageToken=next_page_token,
+                        maxResults=min(100, MAX_COMMENTS - len(comments)),
+                        order="relevance",
+                        textFormat="plainText"
+                    )
+                    response = request.execute()
 
-                
-                valid_json = json.dumps(json_result, ensure_ascii=False, indent=4)
-                results.append(json.loads(valid_json))
+                    for item in response["items"]:
+                        comment = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
+                        comment = self.clean_text(comment)
+                        if comment:
+                            comments.append(comment)
+                            pbar.update(1)
 
-                f.seek(0)
-                json.dump(results, f, ensure_ascii=False, indent=4)
-            logging.info("The result has been appended to the raw_results.json file.")
+                    next_page_token = response.get("nextPageToken")
+                    if not next_page_token:
+                        break
 
-        except Exception as e:
-            logging.error(f"Failed to append the result: {e}")
+                except Exception as e:
+                    logging.error(f"Error fetching comments: {e}")
+                    break
+
+        logging.info(f"✅ Fetched {len(comments)} comments.")
+        self._save(comments, "comments.json")
+        return comments
+
+    def _save(self, comments: list, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(comments, f, ensure_ascii=False, indent=4)
+        logging.info(f"Comments saved to {path}")
 
 
-    def merge_results(self):
-        """Merges all comments into a single JSON structure."""
+class PoliticalCommentAnalyser:
+    """
+    Analyses YouTube comments for political leaning and sentiment using Ollama (local).
 
+    Political leaning score:
+        -1.0  ->  Strongly Democrat / Left-leaning
+         0.0  ->  Neutral / Non-political
+        +1.0  ->  Strongly Republican / Right-leaning
+
+    Categories:
+        - Supportive
+        - Critical
+        - Republican-leaning
+        - Democrat-leaning
+        - Neutral/Informational
+        - Emotional/Reactive
+        - Spam/Irrelevant
+    """
+
+    CATEGORIES = [
+        "Supportive",
+        "Critical",
+        "Republican-leaning",
+        "Democrat-leaning",
+        "Neutral/Informational",
+        "Emotional/Reactive",
+        "Spam/Irrelevant"
+    ]
+
+    def __init__(self):
+        # Verify Ollama is running and model is available
         try:
-            with open(self.raw_results_file_path, "r", encoding="utf-8") as f:
-                all_results = json.load(f)
-            
-            
-            final_results = {
-                "Requests": [],
-                "Complaints": [],
-                "Suggestions": [],
-                "Praise": [],
-                "Troubleshooting": [],
-                "Other": []
-            }
-            
-            
-            for entry in all_results:
-                if isinstance(entry, dict):
-                    for key, value in entry.items():
-                        if key in final_results and isinstance(value, list):
-                            final_results[key].extend(value)
-                        else:
-                            final_results["Other"].extend(value)
-                else:
-                    logging.error(f"Unexpected entry type: {type(entry)} - {entry}")
-
-            with open(self.final_results_file_path, "w", encoding="utf-8") as f:
-                json.dump(final_results, f, ensure_ascii=False, indent=4)
-            
-            logging.info(f"All results have been merged into the {self.final_results_file_path} file.")
-
-        
+            models = ollama.list()
+            available = [m.model for m in models.models]
+            if not any(OLLAMA_MODEL in m for m in available):
+                raise ValueError(f"Model '{OLLAMA_MODEL}' not found. Run: ollama pull {OLLAMA_MODEL}")
+            logging.info(f"✅ Ollama model '{OLLAMA_MODEL}' is ready.")
         except Exception as e:
-            logging.error(f"Failed to merge results: {e}")
+            raise RuntimeError(f"Ollama error: {e}. Make sure Ollama is running.")
 
+    def _build_prompt(self, comments: list) -> str:
+        numbered = "\n".join([f"{i+1}. {c}" for i, c in enumerate(comments)])
+        categories_str = ", ".join(self.CATEGORIES)
+        return f"""You are an expert political analyst specialising in US political discourse and media analysis.
+Analyse the following YouTube comments from a political debate/news video.
 
-    def run(self):
+For EACH comment, return a JSON object with these exact fields:
+- "comment": the original comment text (copy exactly)
+- "category": one of [{categories_str}]
+- "political_score": a float from -1.0 (strongly Democrat/Left) to +1.0 (strongly Republican/Right), 0.0 = neutral
+- "sentiment": one of ["positive", "negative", "neutral"]
+- "confidence": a float from 0.0 to 1.0 indicating how confident you are in your classification
+- "sarcasm_detected": true or false
+- "reasoning": one sentence explaining your classification
+
+Return ONLY a valid JSON array of objects. No extra text, no markdown, no code blocks, no trailing commas.
+
+CRITICAL RULES:
+1. SARCASM: If a comment is sarcastic, FLIP the political_score. E.g. "Oh yeah Trump is SO great" is actually Democrat-leaning, score should be negative. Set sarcasm_detected to true.
+2. CONTEXT AWARENESS: Comments like "he's right" or "I agree" must be interpreted based on WHO they are agreeing with. If agreeing with a Republican figure, score positive. If agreeing with a Democrat figure, score negative.
+3. CODED LANGUAGE: Detect dog whistles and coded political language. E.g. "globalists", "deep state", "stolen election" = Republican-leaning. "systemic racism", "equity", "mostly peaceful" = Democrat-leaning.
+4. CONFIDENCE: Ambiguous or very short comments should have low confidence (0.0-0.4). Clear political statements should have high confidence (0.7-1.0).
+
+SCORING GUIDE:
+  -1.0 to -0.6 : Strongly Democrat / Progressive / Left-wing
+  -0.6 to -0.2 : Mildly Democrat / Centre-left
+  -0.2 to +0.2 : Neutral / Non-political / Centrist
+  +0.2 to +0.6 : Mildly Republican / Centre-right
+  +0.6 to +1.0 : Strongly Republican / Conservative / Right-wing
+
+CATEGORY GUIDE:
+  Supportive            - Agrees with or praises the video/topic/person
+  Critical              - Disagrees with or criticises the video/topic/person
+  Republican-leaning    - Uses conservative talking points (pro-gun, anti-immigration, low taxes, Trump support, election fraud claims)
+  Democrat-leaning      - Uses liberal talking points (pro-choice, climate change, social justice, Biden/Harris support, anti-Trump)
+  Neutral/Informational - Shares facts, asks questions, no clear bias
+  Emotional/Reactive    - Strong emotion (anger, excitement) with no clear political stance
+  Spam/Irrelevant       - Off-topic, promotional, non-English, bot-like, or meaningless
+
+COMMENTS TO ANALYSE:
+{numbered}"""
+
+    def _call_ollama(self, prompt: str, attempt: int = 1):
         try:
-            if not os.path.exists(self.comments_file_path):
-                raise FileNotFoundError(f"Comments file not found: {self.comments_file_path}")
-            
-            with open(self.comments_file_path, 'r', encoding='utf-8') as file:
-                comments_data = json.load(file)
-            
-            if comments_data is None:
-                logging.error("Failed to load comments data.")
-                return
-            
-            chunk_size = 20 # 
-            comments_chunks = self.split_comments(comments_data, chunk_size)
-            
-            logging.info(f"Loaded comments: {comments_data[:5]}")  
-            
-            for idx, chunk in enumerate(comments_chunks):
-                agent = self.create_agent()
-                task = self.create_task(agent, chunk, idx + 1)
-                crew = self.create_crew(agent, [task])
-                
-                result = crew.kickoff(inputs={"comments_chunk": chunk})
-                
-                logging.info(f"Task {idx + 1} raw result: {result}")
-                
-                try:
-                    json_result = json.loads(result)
-                    self.append_result_to_json(result)
-                except json.JSONDecodeError as e:
-                    logging.error(f"JSON decode error after validation: {e}")
-                    logging.error(f"Problematic result: {result}")
-                
-                logging.info(f"Task {idx + 1} output: {result}")
-
-            self.merge_results()
-
+            response = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0}
+            )
+            return response["message"]["content"]
         except Exception as e:
-            logging.error(f"An error occurred: {e}")
+            if attempt < RETRY_ATTEMPTS:
+                logging.warning(f"Ollama error (attempt {attempt}): {e}. Retrying in {RETRY_DELAY}s...")
+                time.sleep(RETRY_DELAY)
+                return self._call_ollama(prompt, attempt + 1)
+            logging.error(f"Ollama failed after {RETRY_ATTEMPTS} attempts: {e}")
+            return None
+
+    def _parse_response(self, raw: str) -> list:
+        try:
+            # Strip any accidental markdown code fences
+            cleaned = re.sub(r"```(?:json)?", "", raw).strip()
+            cleaned = cleaned.rstrip("`").strip()
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON parse error: {e}")
+            logging.error(f"Raw response: {raw[:500]}")
+            return []
+
+    def _init_unified(self) -> dict:
+        """Initialises the single unified results dictionary."""
+        return {
+            "total_comments_analysed": 0,
+            "overall_political_score": 0.0,
+            "overall_leaning": "",
+            "sarcasm_detected_count": 0,
+            "sentiment_breakdown": {
+                "positive": 0,
+                "negative": 0,
+                "neutral":  0
+            },
+            "category_breakdown": {cat: [] for cat in self.CATEGORIES},
+            "score_distribution": {
+                "strongly_democrat":   0,
+                "mildly_democrat":     0,
+                "neutral":             0,
+                "mildly_republican":   0,
+                "strongly_republican": 0
+            },
+            "_all_scores": [],  # Internal — removed before saving
+            "raw_results": []
+        }
+
+    def _append_to_unified(self, results: list, unified: dict):
+        """Appends each comment from a chunk directly into the correct section of the unified dict."""
+        for item in results:
+            unified["raw_results"].append(item)
+            unified["total_comments_analysed"] += 1
+
+            # ── Sarcasm count ─────────────────────────────────────────────────
+            if item.get("sarcasm_detected", False):
+                unified["sarcasm_detected_count"] += 1
+
+            # ── Category ──────────────────────────────────────────────────────
+            cat = item.get("category", "Neutral/Informational")
+            if cat not in unified["category_breakdown"]:
+                cat = "Neutral/Informational"
+            unified["category_breakdown"][cat].append({
+                "comment":          item.get("comment", ""),
+                "political_score":  item.get("political_score", 0.0),
+                "sentiment":        item.get("sentiment", "neutral"),
+                "confidence":       item.get("confidence", 0.0),
+                "sarcasm_detected": item.get("sarcasm_detected", False),
+                "reasoning":        item.get("reasoning", "")
+            })
+
+            # ── Sentiment ─────────────────────────────────────────────────────
+            sentiment = item.get("sentiment", "neutral")
+            if sentiment in unified["sentiment_breakdown"]:
+                unified["sentiment_breakdown"][sentiment] += 1
+
+            # ── Score distribution ────────────────────────────────────────────
+            score = float(item.get("political_score", 0.0))
+            unified["_all_scores"].append(score)
+
+            if score <= -0.6:
+                unified["score_distribution"]["strongly_democrat"] += 1
+            elif score <= -0.2:
+                unified["score_distribution"]["mildly_democrat"] += 1
+            elif score < 0.2:
+                unified["score_distribution"]["neutral"] += 1
+            elif score < 0.6:
+                unified["score_distribution"]["mildly_republican"] += 1
+            else:
+                unified["score_distribution"]["strongly_republican"] += 1
+
+    def _finalise(self, unified: dict):
+        """Calculates the final overall score and leaning label, removes internal keys."""
+        scores = unified.pop("_all_scores", [])
+        avg    = sum(scores) / len(scores) if scores else 0.0
+        unified["overall_political_score"] = round(avg, 4)
+
+        if avg <= -0.6:
+            unified["overall_leaning"] = "Strongly Democrat / Left-leaning"
+        elif avg <= -0.2:
+            unified["overall_leaning"] = "Mildly Democrat / Centre-left"
+        elif avg < 0.2:
+            unified["overall_leaning"] = "Neutral / Centrist"
+        elif avg < 0.6:
+            unified["overall_leaning"] = "Mildly Republican / Centre-right"
+        else:
+            unified["overall_leaning"] = "Strongly Republican / Right-leaning"
+
+    def analyse(self, comments: list) -> dict:
+        chunks  = [comments[i:i + CHUNK_SIZE] for i in range(0, len(comments), CHUNK_SIZE)]
+        unified = self._init_unified()
+
+        print(f"\n🔍 Analysing {len(comments)} comments in {len(chunks)} chunks of {CHUNK_SIZE}...\n")
+
+        for chunk in tqdm(chunks, desc="🧠 Analysing chunks", unit="chunk"):
+            prompt = self._build_prompt(chunk)
+            raw    = self._call_ollama(prompt)
+            if raw:
+                parsed = self._parse_response(raw)
+                self._append_to_unified(parsed, unified)
+
+        self._finalise(unified)
+        return unified
+
+    def print_summary(self, summary: dict):
+        print("\n" + "="*60)
+        print("📊  POLITICAL COMMENT ANALYSIS SUMMARY")
+        print("="*60)
+        print(f"  Total comments analysed : {summary['total_comments_analysed']}")
+        print(f"  Overall political score : {summary['overall_political_score']:+.4f}  (-1=Democrat, +1=Republican)")
+        print(f"  Overall leaning         : {summary['overall_leaning']}")
+        print(f"  Sarcasm detected        : {summary['sarcasm_detected_count']} comments")
+        print("\n  📂 Category Breakdown:")
+        for cat, items in summary["category_breakdown"].items():
+            print(f"     {cat:<25} {len(items)} comments")
+        print("\n  😊 Sentiment Breakdown:")
+        for sentiment, count in summary["sentiment_breakdown"].items():
+            print(f"     {sentiment:<10} {count}")
+        print("\n  🗳️  Score Distribution:")
+        dist  = summary["score_distribution"]
+        total = summary["total_comments_analysed"] or 1
+        for label, count in dist.items():
+            bar = "█" * int((count / total) * 30)
+            print(f"     {label:<22} {bar} {count}")
+        print("="*60 + "\n")
+
+
+def main():
+    # ── Step 1: Fetch Comments ────────────────────────────────────────────────
+    fetcher   = YouTubeCommentsFetcher()
+    video_url = input("🚀 Enter YouTube URL: ").strip()
+    comments  = fetcher.fetch(video_url)
+
+    if not comments:
+        print("❌ No comments fetched. Please check your YouTube API key and URL.")
+        return
+
+    # ── Step 2: Analyse Comments ──────────────────────────────────────────────
+    analyser = PoliticalCommentAnalyser()
+    summary  = analyser.analyse(comments)
+
+    # ── Step 3: Save Results ──────────────────────────────────────────────────
+    with open("raw_results.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=4)
+    logging.info("✅ Full results saved to raw_results.json")
+
+    # ── Step 4: Print Summary ─────────────────────────────────────────────────
+    analyser.print_summary(summary)
+
 
 if __name__ == "__main__":
-    yt_tool = YouTubeCommentsTool()
-    video_url = input("🚀 Enter YouTube URL: ")
-    yt_tool._run(video_url)
-
-    comments_file_path = "comments.json"
-    comments_analysis = CommentsAnalysis(comments_file_path)
-    comments_analysis.run()
+    main()
